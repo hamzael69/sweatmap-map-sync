@@ -1,0 +1,205 @@
+name: Test France PMTiles
+
+on:
+  workflow_dispatch:
+    inputs:
+      latitude:
+        description: "Latitude de test"
+        required: true
+        default: "45.4397"
+      longitude:
+        description: "Longitude de test"
+        required: true
+        default: "4.3872"
+
+jobs:
+  test-pmtiles:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install test dependencies
+        run: |
+          mkdir pmtiles-test
+          cd pmtiles-test
+          npm init -y
+          npm install pmtiles @mapbox/vector-tile pbf
+
+      - name: Create PMTiles test script
+        run: |
+          cd pmtiles-test
+
+          cat > test.mjs <<'EOF'
+          import { PMTiles } from "pmtiles";
+          import { VectorTile } from "@mapbox/vector-tile";
+          import Pbf from "pbf";
+
+          const url =
+            "https://huggingface.co/datasets/yatso6/sweatmap-france-map-v1/resolve/main/france-v1.pmtiles";
+
+          const lat = Number(process.env.TEST_LAT);
+          const lon = Number(process.env.TEST_LON);
+
+          // Shortbread utilise au maximum le zoom 14.
+          const z = 14;
+
+          function lonToTileX(lon, zoom) {
+            return Math.floor(((lon + 180) / 360) * 2 ** zoom);
+          }
+
+          function latToTileY(lat, zoom) {
+            const rad = (lat * Math.PI) / 180;
+
+            return Math.floor(
+              ((1 - Math.asinh(Math.tan(rad)) / Math.PI) / 2) *
+                2 ** zoom
+            );
+          }
+
+          const x = lonToTileX(lon, z);
+          const y = latToTileY(lat, z);
+
+          console.log("");
+          console.log("=== SWEATMAP PMTILES TEST ===");
+          console.log("");
+          console.log("Position :", lat, lon);
+          console.log("Tuile    :", `${z}/${x}/${y}`);
+          console.log("Source   :", url);
+          console.log("");
+
+          const archive = new PMTiles(url);
+
+          console.log("Lecture du header PMTiles...");
+
+          const header = await archive.getHeader();
+
+          console.log("PMTiles OK");
+          console.log("Min zoom :", header.minZoom);
+          console.log("Max zoom :", header.maxZoom);
+          console.log("");
+
+          console.log("Téléchargement de la petite tuile correspondante...");
+
+          const tile = await archive.getZxy(z, x, y);
+
+          if (!tile) {
+            throw new Error(
+              `Aucune tuile disponible pour ${z}/${x}/${y}`
+            );
+          }
+
+          console.log(
+            "Tuile récupérée :",
+            tile.data.byteLength,
+            "octets"
+          );
+
+          const vectorTile = new VectorTile(
+            new Pbf(new Uint8Array(tile.data))
+          );
+
+          const layerNames = Object.keys(vectorTile.layers);
+
+          console.log("");
+          console.log("Couches trouvées :");
+          console.log(layerNames.join(", "));
+          console.log("");
+
+          const streets = vectorTile.layers.streets;
+
+          if (!streets) {
+            throw new Error(
+              'La couche "streets" est absente de cette tuile.'
+            );
+          }
+
+          console.log(
+            "Nombre de géométries dans streets :",
+            streets.length
+          );
+
+          const usableKinds = new Set([
+            "residential",
+            "living_street",
+            "pedestrian",
+            "footway",
+            "path",
+            "track",
+            "service",
+            "unclassified",
+            "tertiary",
+            "secondary",
+            "primary",
+            "steps",
+            "cycleway",
+          ]);
+
+          let usableCount = 0;
+          const samples = [];
+
+          for (let i = 0; i < streets.length; i++) {
+            const feature = streets.feature(i);
+            const geojson = feature.toGeoJSON(x, y, z);
+
+            const kind = geojson.properties?.kind ?? "unknown";
+
+            if (!usableKinds.has(kind)) {
+              continue;
+            }
+
+            usableCount++;
+
+            if (samples.length < 10) {
+              let points = 0;
+
+              if (geojson.geometry.type === "LineString") {
+                points = geojson.geometry.coordinates.length;
+              } else if (
+                geojson.geometry.type === "MultiLineString"
+              ) {
+                points = geojson.geometry.coordinates.reduce(
+                  (total, line) => total + line.length,
+                  0
+                );
+              }
+
+              samples.push({
+                kind,
+                geometry: geojson.geometry.type,
+                points,
+              });
+            }
+          }
+
+          console.log("");
+          console.log(
+            "Routes potentiellement utilisables par SweatMap :",
+            usableCount
+          );
+
+          console.log("");
+          console.log("Exemples :");
+
+          for (const sample of samples) {
+            console.log(
+              `- ${sample.kind} | ${sample.geometry} | ${sample.points} points`
+            );
+          }
+
+          console.log("");
+          console.log("================================");
+          console.log("✅ TEST PMTILES SWEATMAP RÉUSSI");
+          console.log("================================");
+          EOF
+
+      - name: Read roads around test position
+        env:
+          TEST_LAT: ${{ inputs.latitude }}
+          TEST_LON: ${{ inputs.longitude }}
+        run: |
+          cd pmtiles-test
+          node test.mjs
