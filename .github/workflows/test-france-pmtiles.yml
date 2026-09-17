@@ -36,7 +36,7 @@ jobs:
           cat > test.mjs <<'EOF'
           import { PMTiles } from "pmtiles";
           import { VectorTile } from "@mapbox/vector-tile";
-          import Pbf from "pbf";
+          import { PbfReader } from "pbf";
 
           const url =
             "https://huggingface.co/datasets/yatso6/sweatmap-france-map-v1/resolve/main/france-v1.pmtiles";
@@ -44,7 +44,6 @@ jobs:
           const lat = Number(process.env.TEST_LAT);
           const lon = Number(process.env.TEST_LON);
 
-          // Shortbread utilise au maximum le zoom 14.
           const z = 14;
 
           function lonToTileX(lon, zoom) {
@@ -82,7 +81,9 @@ jobs:
           console.log("Max zoom :", header.maxZoom);
           console.log("");
 
-          console.log("Téléchargement de la petite tuile correspondante...");
+          console.log(
+            "Téléchargement de la petite tuile correspondante..."
+          );
 
           const tile = await archive.getZxy(z, x, y);
 
@@ -99,7 +100,7 @@ jobs:
           );
 
           const vectorTile = new VectorTile(
-            new Pbf(new Uint8Array(tile.data))
+            new PbfReader(new Uint8Array(tile.data))
           );
 
           const layerNames = Object.keys(vectorTile.layers);
