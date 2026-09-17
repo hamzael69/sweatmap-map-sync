@@ -9,10 +9,22 @@ jobs:
 
     steps:
       - name: Download France PMTiles from BBBike
-        run: |
-          curl -L --fail --retry 5 \
-            -o france.zip \
-            "https://data.bbbike.org/osm/pmtiles/region/europe/france/france.osm.pmtiles-shortbread.zip"
+  run: |
+    sudo apt-get update
+    sudo apt-get install -y aria2
+
+    aria2c \
+      --continue=true \
+      --max-tries=0 \
+      --retry-wait=10 \
+      --timeout=60 \
+      --connect-timeout=30 \
+      --split=4 \
+      --max-connection-per-server=4 \
+      --min-split-size=20M \
+      --file-allocation=none \
+      --out=france.zip \
+      "https://data.bbbike.org/osm/pmtiles/region/europe/france/france.osm.pmtiles-shortbread.zip"
 
       - name: Extract PMTiles
         run: |
