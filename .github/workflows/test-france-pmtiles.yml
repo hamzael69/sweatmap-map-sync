@@ -29,7 +29,7 @@ jobs:
           npm init -y
           npm install pmtiles @mapbox/vector-tile pbf
 
-      - name: Create PMTiles test script
+      - name: Create PMTiles nearest road test
         run: |
           cd pmtiles-test
 
@@ -59,69 +59,99 @@ jobs:
             );
           }
 
-          const x = lonToTileX(lon, z);
-          const y = latToTileY(lat, z);
+          function projectToMeters(coord, referenceLat, referenceLon) {
+            const [coordLon, coordLat] = coord;
 
-          console.log("");
-          console.log("=== SWEATMAP PMTILES TEST ===");
-          console.log("");
-          console.log("Position :", lat, lon);
-          console.log("Tuile    :", `${z}/${x}/${y}`);
-          console.log("Source   :", url);
-          console.log("");
+            const metersPerDegreeLat = 111320;
+            const metersPerDegreeLon =
+              111320 * Math.cos((referenceLat * Math.PI) / 180);
 
-          const archive = new PMTiles(url);
-
-          console.log("Lecture du header PMTiles...");
-
-          const header = await archive.getHeader();
-
-          console.log("PMTiles OK");
-          console.log("Min zoom :", header.minZoom);
-          console.log("Max zoom :", header.maxZoom);
-          console.log("");
-
-          console.log(
-            "Téléchargement de la petite tuile correspondante..."
-          );
-
-          const tile = await archive.getZxy(z, x, y);
-
-          if (!tile) {
-            throw new Error(
-              `Aucune tuile disponible pour ${z}/${x}/${y}`
-            );
+            return {
+              x: (coordLon - referenceLon) * metersPerDegreeLon,
+              y: (coordLat - referenceLat) * metersPerDegreeLat,
+            };
           }
 
-          console.log(
-            "Tuile récupérée :",
-            tile.data.byteLength,
-            "octets"
-          );
+          function closestPointOnSegment(a, b) {
+            const abX = b.x - a.x;
+            const abY = b.y - a.y;
 
-          const vectorTile = new VectorTile(
-            new PbfReader(new Uint8Array(tile.data))
-          );
+            const lengthSquared =
+              abX * abX + abY * abY;
 
-          const layerNames = Object.keys(vectorTile.layers);
+            if (lengthSquared === 0) {
+              return {
+                x: a.x,
+                y: a.y,
+                distance: Math.sqrt(a.x * a.x + a.y * a.y),
+              };
+            }
 
-          console.log("");
-          console.log("Couches trouvées :");
-          console.log(layerNames.join(", "));
-          console.log("");
+            let t =
+              -(a.x * abX + a.y * abY) /
+              lengthSquared;
 
-          const streets = vectorTile.layers.streets;
+            t = Math.max(0, Math.min(1, t));
 
-          if (!streets) {
-            throw new Error(
-              'La couche "streets" est absente de cette tuile.'
-            );
+            const x = a.x + t * abX;
+            const y = a.y + t * abY;
+
+            return {
+              x,
+              y,
+              distance: Math.sqrt(x * x + y * y),
+            };
           }
 
-          console.log(
-            "Nombre de géométries dans streets :",
-            streets.length
-          );
+          function distanceToLineString(coordinates) {
+            let minDistance = Infinity;
+
+            for (let i = 0; i < coordinates.length - 1; i++) {
+              const a = projectToMeters(
+                coordinates[i],
+                lat,
+                lon
+              );
+
+              const b = projectToMeters(
+                coordinates[i + 1],
+                lat,
+                lon
+              );
+
+              const closest = closestPointOnSegment(a, b);
+
+              if (closest.distance < minDistance) {
+                minDistance = closest.distance;
+              }
+            }
+
+            return minDistance;
+          }
+
+          function distanceToGeometry(geometry) {
+            if (geometry.type === "LineString") {
+              return distanceToLineString(
+                geometry.coordinates
+              );
+            }
+
+            if (geometry.type === "MultiLineString") {
+              let minDistance = Infinity;
+
+              for (const line of geometry.coordinates) {
+                const distance = distanceToLineString(line);
+
+                if (distance < minDistance) {
+                  minDistance = distance;
+                }
+              }
+
+              return minDistance;
+            }
+
+            return Infinity;
+          }
 
           const usableKinds = new Set([
             "residential",
@@ -139,65 +169,207 @@ jobs:
             "cycleway",
           ]);
 
-          let usableCount = 0;
-          const samples = [];
+          const centerX = lonToTileX(lon, z);
+          const centerY = latToTileY(lat, z);
 
-          for (let i = 0; i < streets.length; i++) {
-            const feature = streets.feature(i);
-            const geojson = feature.toGeoJSON(x, y, z);
+          console.log("");
+          console.log("=== SWEATMAP PMTILES NEAREST ROAD TEST ===");
+          console.log("");
+          console.log("Position GPS :", lat, lon);
+          console.log(
+            "Tuile centrale :",
+            `${z}/${centerX}/${centerY}`
+          );
+          console.log("");
 
-            const kind = geojson.properties?.kind ?? "unknown";
+          const archive = new PMTiles(url);
 
-            if (!usableKinds.has(kind)) {
-              continue;
-            }
+          console.log("Lecture du header PMTiles...");
 
-            usableCount++;
+          const header = await archive.getHeader();
 
-            if (samples.length < 10) {
-              let points = 0;
+          console.log("PMTiles OK");
+          console.log("Min zoom :", header.minZoom);
+          console.log("Max zoom :", header.maxZoom);
+          console.log("");
 
-              if (geojson.geometry.type === "LineString") {
-                points = geojson.geometry.coordinates.length;
-              } else if (
-                geojson.geometry.type === "MultiLineString"
-              ) {
-                points = geojson.geometry.coordinates.reduce(
-                  (total, line) => total + line.length,
-                  0
-                );
+          const candidates = [];
+
+          /*
+           * On lit la tuile centrale + les 8 voisines.
+           * Ça évite un problème si le GPS est proche
+           * du bord d'une tuile.
+           */
+          for (let offsetX = -1; offsetX <= 1; offsetX++) {
+            for (let offsetY = -1; offsetY <= 1; offsetY++) {
+              const tileX = centerX + offsetX;
+              const tileY = centerY + offsetY;
+
+              const tile = await archive.getZxy(
+                z,
+                tileX,
+                tileY
+              );
+
+              if (!tile) {
+                continue;
               }
 
-              samples.push({
-                kind,
-                geometry: geojson.geometry.type,
-                points,
-              });
+              const vectorTile = new VectorTile(
+                new PbfReader(
+                  new Uint8Array(tile.data)
+                )
+              );
+
+              const streets =
+                vectorTile.layers.streets;
+
+              if (!streets) {
+                continue;
+              }
+
+              for (let i = 0; i < streets.length; i++) {
+                const feature = streets.feature(i);
+
+                const geojson = feature.toGeoJSON(
+                  tileX,
+                  tileY,
+                  z
+                );
+
+                const kind =
+                  geojson.properties?.kind ??
+                  "unknown";
+
+                if (!usableKinds.has(kind)) {
+                  continue;
+                }
+
+                const distance =
+                  distanceToGeometry(
+                    geojson.geometry
+                  );
+
+                if (!Number.isFinite(distance)) {
+                  continue;
+                }
+
+                candidates.push({
+                  distance,
+                  kind,
+                  featureId:
+                    feature.id ?? null,
+                  properties:
+                    geojson.properties ?? {},
+                  geometry:
+                    geojson.geometry,
+                  tile: `${z}/${tileX}/${tileY}`,
+                });
+              }
             }
+          }
+
+          candidates.sort(
+            (a, b) =>
+              a.distance - b.distance
+          );
+
+          console.log(
+            "Routes candidates trouvées :",
+            candidates.length
+          );
+
+          console.log("");
+
+          if (candidates.length === 0) {
+            throw new Error(
+              "Aucune route utilisable trouvée autour du GPS."
+            );
+          }
+
+          const nearest = candidates[0];
+
+          console.log("=== ROUTE LA PLUS PROCHE ===");
+          console.log("");
+          console.log(
+            "Distance GPS → route :",
+            nearest.distance.toFixed(2),
+            "m"
+          );
+          console.log(
+            "Type de route :",
+            nearest.kind
+          );
+          console.log(
+            "Tuile :",
+            nearest.tile
+          );
+          console.log(
+            "Feature ID :",
+            nearest.featureId
+          );
+
+          console.log("");
+          console.log("Propriétés :");
+          console.log(
+            JSON.stringify(
+              nearest.properties,
+              null,
+              2
+            )
+          );
+
+          console.log("");
+          console.log("Géométrie :");
+          console.log(
+            nearest.geometry.type
+          );
+
+          if (
+            nearest.geometry.type ===
+            "LineString"
+          ) {
+            console.log(
+              "Nombre de points :",
+              nearest.geometry.coordinates.length
+            );
+
+            console.log(
+              "Premier point :",
+              nearest.geometry.coordinates[0]
+            );
+
+            console.log(
+              "Dernier point :",
+              nearest.geometry.coordinates[
+                nearest.geometry.coordinates.length - 1
+              ]
+            );
           }
 
           console.log("");
           console.log(
-            "Routes potentiellement utilisables par SweatMap :",
-            usableCount
+            "=== 10 ROUTES LES PLUS PROCHES ==="
           );
 
-          console.log("");
-          console.log("Exemples :");
-
-          for (const sample of samples) {
+          for (
+            const candidate
+            of candidates.slice(0, 10)
+          ) {
             console.log(
-              `- ${sample.kind} | ${sample.geometry} | ${sample.points} points`
+              `${candidate.distance.toFixed(2)} m | ${candidate.kind} | ${candidate.tile}`
             );
           }
 
           console.log("");
           console.log("================================");
-          console.log("✅ TEST PMTILES SWEATMAP RÉUSSI");
+          console.log(
+            "✅ ROUTE PMTILES TROUVÉE DEPUIS LE GPS"
+          );
           console.log("================================");
           EOF
 
-      - name: Read roads around test position
+      - name: Find nearest road from GPS
         env:
           TEST_LAT: ${{ inputs.latitude }}
           TEST_LON: ${{ inputs.longitude }}
