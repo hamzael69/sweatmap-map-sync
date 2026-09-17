@@ -1,0 +1,45 @@
+name: Import France PMTiles
+
+on:
+  workflow_dispatch:
+
+jobs:
+  import-france:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Download France PMTiles from BBBike
+        run: |
+          curl -L --fail --retry 5 \
+            -o france.zip \
+            "https://data.bbbike.org/osm/pmtiles/region/europe/france/france.osm.pmtiles-shortbread.zip"
+
+      - name: Extract PMTiles
+        run: |
+          unzip france.zip -d extracted
+          find extracted -type f -maxdepth 2 -print
+
+          PMTILES_FILE=$(find extracted -type f -name "*.pmtiles" | head -n 1)
+
+          if [ -z "$PMTILES_FILE" ]; then
+            echo "Aucun fichier .pmtiles trouvé"
+            exit 1
+          fi
+
+          mv "$PMTILES_FILE" france-v1.pmtiles
+          ls -lh france-v1.pmtiles
+
+      - name: Install Hugging Face CLI
+        run: |
+          python -m pip install --upgrade huggingface_hub hf_xet
+
+      - name: Upload to Hugging Face
+        env:
+          HF_TOKEN: ${{ secrets.HF_TOKEN }}
+        run: |
+          hf upload \
+            yatso6/sweatmap-france-map-v1 \
+            france-v1.pmtiles \
+            france-v1.pmtiles \
+            --repo-type dataset \
+            --token "$HF_TOKEN"
